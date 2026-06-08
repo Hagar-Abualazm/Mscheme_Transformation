@@ -110,31 +110,42 @@ for i in range(1, len(rows)):
 
 perf = ((A-1)/A)*(hw/2)  # HO relative kinetic-energy prefactor (A-1)/A * hw/2; loop-invariant
 
+# T_ij is nonzero only between orbitals sharing the same (l, j, m, mt) and with n differing by
+# 0 or +-1. Group orbitals by that key (preserving sp_id order within each group) so the inner
+# loop visits only the orbitals that can couple -- O(states * group_size) instead of O(states^2).
+# Iterating ke_orbitals (sp_id order) outer and each key-group (sp_id order) inner reproduces the
+# original row order exactly, so Tsingle.csv is byte-for-byte unchanged.
+ke_groups = {}
+for o in ke_orbitals:
+    ke_groups.setdefault(o[4], []).append(o)
+
 for oi in ke_orbitals:
-    for oj in ke_orbitals:
-        if oi[4] == oj[4]:                      # same (l, j, m, mt) string-key as original
-            if oi[1] == oj[1]:                  # n equal (string compare, as original)
-                tij = perf * (2 * oi[2] + oi[3] + 1.5)
-                T_columns.append([oi[0], oj[0], tij])
+    for oj in ke_groups[oi[4]]:                 # same (l, j, m, mt) key as original's inner filter
+        if oi[1] == oj[1]:                      # n equal (string compare, as original)
+            tij = perf * (2 * oi[2] + oi[3] + 1.5)
+            T_columns.append([oi[0], oj[0], tij])
 
-            elif oi[2] == oj[2] - 1:             # n_i == n_j - 1
-                tij = perf * math.sqrt(oj[2] * (oj[2] + oj[3] + 0.5))
-                T_columns.append([oi[0], oj[0], tij])
+        elif oi[2] == oj[2] - 1:                 # n_i == n_j - 1
+            tij = perf * math.sqrt(oj[2] * (oj[2] + oj[3] + 0.5))
+            T_columns.append([oi[0], oj[0], tij])
 
-            elif oi[2] == oj[2] + 1:             # n_i == n_j + 1
-                tij = perf * math.sqrt((oj[2] + 1) * (oj[3] + oj[2] + 1.5))
-                T_columns.append([oi[0], oj[0], tij])
+        elif oi[2] == oj[2] + 1:                 # n_i == n_j + 1
+            tij = perf * math.sqrt((oj[2] + 1) * (oj[3] + oj[2] + 1.5))
+            T_columns.append([oi[0], oj[0], tij])
 
 #==================================================Channel type helper=========================================================================#
 
 #This ensures that CG transformation is only applied to the correct potential channel:
 def pair_channel(mt1, mt2):
-    pair = tuple(sorted((float(mt1), float(mt2))))
-    if pair == (-0.5, -0.5):
+    # mt are +-1/2, so the channel is fixed by their (exactly representable) sum, which avoids
+    # the tuple(sorted(...)) allocation in the hot path: -1 -> pp, +1 -> nn, 0 -> pn.
+    # Identical result to the original on valid inputs; still guards against unexpected ones.
+    s = mt1 + mt2
+    if s == -1.0:
         return "pp"
-    elif pair == (0.5, 0.5):
+    elif s == 1.0:
         return "nn"
-    elif pair == (-0.5, 0.5):
+    elif s == 0.0:
         return "pn"
     else:
         raise ValueError(f"Unexpected isospin pair: {(mt1, mt2)}")
