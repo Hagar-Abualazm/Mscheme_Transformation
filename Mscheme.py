@@ -1,27 +1,41 @@
-import csv, math
+import csv, math, argparse
 # Step 2: production path uses the pure-stdlib, lru_cache-memoized numeric Clebsch-Gordan
 # (Condon-Shortley) from cg_numeric.py instead of sympy's symbolic implementation, which
 # was ~100-1000x slower per call. Validated against sympy to <1e-12 by validate_cg.py.
 from cg_numeric import clebsch_gordan
 
-# Step 5 (NumPy vectorization) — DEFERRED, intentionally not done.
-# At the current model space (emax4: 16 orbitals, ~11,759 MFDn records) the runtime is
-# ~0.17s, so vectorizing the accumulation loop with NumPy isn't worth the correctness risk
-# (summation-order changes would perturb the last ULPs and break exact reproducibility).
-# Revisit ONLY if the model space grows (larger emax) and the runtime climbs back into the
-# seconds-to-minutes range; profile first to confirm the accumulation loop is the hot spot.
+# Scaling to larger model spaces (emax2=40, emax4=140 single-particle states) drove a series
+# of algorithmic fixes. The quartet transform was originally O(n^4) in the orbital count
+# (emax4 -> 384M iterations, ~15 min). Profiling showed two facts: (1) of the 15.4M quartets
+# that satisfy the (M, MT) conservation rules at emax4, only ~563k (1 in 28) actually have a
+# matching MFDn record -- the rest contribute nothing and are filtered out; (2) the symbolic
+# overhead was gone, so ~93% of the time was spent *rejecting* those unmatched quartets.
+# The current code therefore drives the transform directly from the (few) target-channel MFDn
+# quartets (see "Basis Decoupling" below), enumerating only the m-scheme substate quartets that
+# can contribute. NumPy vectorization remains unnecessary: the residual cost is the unavoidable
+# per-quartet CG accumulation, which is already < 1s, not the enumeration.
 
 #=================================================Inputs and initialization:===========================================================#
 #number or particles, protons, neutrons, frequency
 A=2 ; Z = 1; Neut = A - Z; hw=16
 
-#state_map is a file that lists all single-particle orbitals id and their quantum numbers
-state_map_path = "state_map_2B.csv"
+# Input/output paths are CLI-parametrized (defaults reproduce the original hardcoded run),
+# so the same script handles any model space, e.g.:
+#   python3 Mscheme.py --state-map emax4_state_map.csv --out-mscheme emax4_Mscheme.csv
+_p = argparse.ArgumentParser(
+    description="Transform MFDn coupled-JT two-body matrix elements to the M-scheme single-particle basis.")
+_p.add_argument("--state-map", default="state_map_2B.csv",
+                help="single-particle state map CSV (lists each orbital's id and quantum numbers)")
+_p.add_argument("--mfdn", default="Helium_2_data_N3LO_EM500_srg1.0_hw16_emax4_e2max8.MFDn",
+                help="MFDn two-body matrix-element file in the coupled JT basis")
+_p.add_argument("--out-mscheme", default="Mscheme.csv", help="output M-scheme TBME CSV")
+_p.add_argument("--out-tsingle", default="Tsingle.csv", help="output one-body kinetic-energy CSV")
+_args = _p.parse_args()
 
-#MFDn is the two-body-matrix elements file in the coupled JT basis
-MFDN_path = "Helium_2_data_N3LO_EM500_srg1.0_hw16_emax4_e2max8.MFDn"
+state_map_path = _args.state_map
+MFDN_path = _args.mfdn
 
-T_columns = []; sp_tbme = {}; mfdn_tbme = {}
+T_columns = []
 
 # Step 1 optimization: index MFDn records by their orbital quartet, pre-filtered to the
 # target (J,T) channel. The original code linearly scanned all ~11,759 records for every
@@ -46,18 +60,15 @@ with open(MFDN_path, "r") as f:
     raw = [ln.strip() for ln in f if ln.strip()]
 data = [ln.split() for ln in raw[1:] if len(ln.split()) == 12]
 
-for r, toks in enumerate(data):
-    mfdn_list = [int(toks[COL_A]), int(toks[COL_B]), int(toks[COL_C]), int(toks[COL_D])]
+for toks in data:
     J = float(toks[COL_J]); T = int(toks[COL_T])
-    Trel = float(toks[COL_TREL]); Vpn = float(toks[COL_VPN]); Vpp = float(toks[COL_VPP]); Vnn = float(toks[COL_VNN])
-
-    #build the MFDn dictionary
-    record = [mfdn_list, J, T, Trel, Vpn, Vpp, Vnn]
-    mfdn_tbme[str(r+1)] = record
-
-    # Pre-filter to the target channel only (the decoupling loop discards everything else),
-    # and bucket by quartet tuple. Append preserves original file/insertion order.
+    # Pre-filter to the target channel only (the decoupling discards everything else), and
+    # bucket by orbital quartet. Append preserves original file order, so the per-quartet
+    # accumulation order downstream is unchanged.
     if J == J_target and T == T_target:
+        mfdn_list = [int(toks[COL_A]), int(toks[COL_B]), int(toks[COL_C]), int(toks[COL_D])]
+        Trel = float(toks[COL_TREL]); Vpn = float(toks[COL_VPN]); Vpp = float(toks[COL_VPP]); Vnn = float(toks[COL_VNN])
+        record = [mfdn_list, J, T, Trel, Vpn, Vpp, Vnn]
         mfdn_by_quartet.setdefault(tuple(mfdn_list), []).append(record)
 
 #===============================================State Map file Reader========================================================================#
@@ -66,40 +77,20 @@ with open(state_map_path, "r", newline="") as file:
     rows = list(reader)
 
 # Step 3: parse the single-particle orbitals once into typed records, instead of re-casting
-# CSV string cells inside the 4-deep (O(n^4)) loop. Each record: (id, orb, n, l, j, m, mt).
+# CSV string cells inside the hot loops. Each record: (id, orb, n, l, j, m, mt).
 orbitals = [
     (int(row[0]), int(row[1]), int(row[2]),
      float(row[3]), float(row[4]), float(row[5]), float(row[6]))
     for row in rows[1:]
 ]
 
-# Step 3: O(1) set membership for quartet de-duplication, replacing the former
-# `[a,b,c,d] not in sp_quartet` linear scan of a growing list (which made the build O(n^8)).
-sp_quartet_seen = set()
-for oa in orbitals:
-    for ob in orbitals:
-        for oc in orbitals:
-            for od in orbitals:
-
-                #list all the unique single-particle orbital quartets:
-                a = oa[0]; b = ob[0]; c = oc[0]; d = od[0]
-                quartet_key = (a, b, c, d)
-                if quartet_key not in sp_quartet_seen:
-                    sp_quartet_seen.add(quartet_key)
-
-                    #get their quantum numbers (orb, n, l, j, m, mt) from the parsed records:
-                    a_orb, a_n, a_l, a_j, a_m, a_mt = oa[1], oa[2], oa[3], oa[4], oa[5], oa[6]
-                    b_orb, b_n, b_l, b_j, b_m, b_mt = ob[1], ob[2], ob[3], ob[4], ob[5], ob[6]
-                    c_orb, c_n, c_l, c_j, c_m, c_mt = oc[1], oc[2], oc[3], oc[4], oc[5], oc[6]
-                    d_orb, d_n, d_l, d_j, d_m, d_mt = od[1], od[2], od[3], od[4], od[5], od[6]  # mt (proton) = -1/2  # mt (neutron) = +1/2
-
-                    # Conservation of angular momentum and isospin selection rules (only include valid quartets):
-                    if a_m + b_m == c_m + d_m and a_mt + b_mt == c_mt + d_mt:
-
-                        # build the sp-dictionary
-                        sp_key = str(a) + "," + str(b) + "," + str(c) + "," + str(d)
-                        sp_tbme[sp_key] = [[a, b, c, d], [a_orb, b_orb, c_orb, d_orb], [a_n, b_n, c_n, d_n], [a_l, b_l, c_l, d_l],
-                                           [a_j, b_j, c_j, d_j], [a_m, b_m, c_m, d_m], [a_mt, b_mt, c_mt, d_mt], 0, 0, 0, 0]
+# Index each coupled orbital (orb_id) -> its list of m-scheme substates (sp_id, j, m, mt),
+# in sp_id order. The decoupling below is driven from the MFDn orbital quartets and looks up
+# the substates of each orbital here. Keeping sp_id order lets us sort the generated quartets
+# back into the original (a,b,c,d) order for byte-for-byte identical output.
+orb_to_sub = {}
+for o in orbitals:
+    orb_to_sub.setdefault(o[1], []).append((o[0], o[4], o[5], o[6]))  # (sp_id, j, m, mt)
 
 #=======================================================constructing singe body kinetic energy ===================================================================#
 
@@ -150,86 +141,97 @@ def pair_channel(mt1, mt2):
 
 # =====================================================Basis Decoupling======================================================================#
 
-for key in sp_tbme.keys():
-    #for each quartet in the single particle dictionary:
-
-    x = sp_tbme[key][1][0];    y = sp_tbme[key][1][1];    z = sp_tbme[key][1][2];    s = sp_tbme[key][1][3]
-    j_x = sp_tbme[key][4][0];  j_y = sp_tbme[key][4][1];  j_z = sp_tbme[key][4][2];  j_s = sp_tbme[key][4][3]
-    m_x = sp_tbme[key][5][0];  m_y = sp_tbme[key][5][1];  m_z = sp_tbme[key][5][2];  m_s = sp_tbme[key][5][3]
-    mt_x = sp_tbme[key][6][0]; mt_y = sp_tbme[key][6][1]; mt_z = sp_tbme[key][6][2]; mt_s = sp_tbme[key][6][3]
-
-    #total M and isospin
-    M  = m_x + m_y
-    Mt = mt_x + mt_y
-
-    sp_Trel = 0.0; sp_Vpn  = 0.0; sp_Vpp  = 0.0; sp_Vnn  = 0.0
-
-    #checking interaction channel type:
-    bra_channel = pair_channel(mt_x, mt_y); ket_channel = pair_channel(mt_z, mt_s)
-    # For a charge-conserving strong interaction, bra and ket should be in the same channel.
-    if bra_channel != ket_channel:
-        sp_tbme[key][7]  = 0.0; sp_tbme[key][8]  = 0.0; sp_tbme[key][9]  = 0.0; sp_tbme[key][10] = 0.0
+# Drive the transform directly from the target-channel MFDn quartets. For each coupled orbital
+# quartet (x,y,z,s) we enumerate only the m-scheme substate quartets (a in x, b in y, c in z,
+# d in s) that conserve (M, MT) -- found by pair-bucketing the ket (c,d) substates on their
+# (M, MT) -- and accumulate the CG-weighted matrix elements. This visits only the ~563k
+# quartets that can contribute (emax4), never the 15.4M conserved-but-unmatched ones. The
+# numerics are identical to the original: same CG calls and multiply order, same loop-invariant
+# normalization, and the same per-quartet accumulation over `locations` in MFDn file order.
+# Rows are sorted by (a,b,c,d) afterwards to reproduce the original output ordering exactly.
+data1 = []
+for (x, y, z, s), locations in mfdn_by_quartet.items():
+    subA = orb_to_sub.get(x); subB = orb_to_sub.get(y)
+    subC = orb_to_sub.get(z); subD = orb_to_sub.get(s)
+    # Skip quartets whose orbitals are outside this model space's state map (e.g. an emax2 run
+    # against the emax4 MFDn file): those orbitals simply have no m-scheme substates here.
+    if not (subA and subB and subC and subD):
         continue
 
-    channel = bra_channel
+    # normalization is loop-invariant for the orbital quartet (depends only on x==y, z==s)
+    norm = math.sqrt(1 + (1 if x == y else 0)) * math.sqrt(1 + (1 if z == s else 0))
 
-    #find all the location(s)/coupled interactions in the MFDN file that contribute to this
-    # single-particle quartet. Step 1: O(1) dict lookup into the pre-filtered (J=J_target,
-    # T=T_target) quartet index, replacing the former O(N_mfdn) linear scan. The returned
-    # records are already in original file order, so accumulation order is unchanged.
-    locations = mfdn_by_quartet.get((x, y, z, s), [])
-    if locations:
-        for rec in locations:
-            J_location    = rec[1]
-            T_location    = rec[2]
-            Trel_location = rec[3]
-            Vpn_location  = rec[4]
-            Vpp_location  = rec[5]
-            Vnn_location  = rec[6]
+    # bucket ket substate pairs (c,d) by (M, MT); precompute each pair's charge channel once
+    ket_buckets = {}
+    for sc in subC:
+        for sd in subD:
+            ket_buckets.setdefault((sc[2] + sd[2], sc[3] + sd[3]), []).append(
+                (sc, sd, pair_channel(sc[3], sd[3])))
 
-            cg_momentum = (clebsch_gordan(j_x, j_y, J_location, m_x, m_y, M)
-                        * clebsch_gordan(j_z, j_s, J_location, m_z, m_s, M))
+    for sa in subA:
+        a = sa[0]; j_x = sa[1]; m_x = sa[2]; mt_x = sa[3]
+        for sb in subB:
+            b = sb[0]; j_y = sb[1]; m_y = sb[2]; mt_y = sb[3]
+            M = m_x + m_y; Mt = mt_x + mt_y
+            kets = ket_buckets.get((M, Mt))
+            if not kets:
+                continue
+            bra_channel = pair_channel(mt_x, mt_y)
 
-            cg_isospin = (clebsch_gordan(1/2, 1/2, T_location, mt_x, mt_y, Mt)
-                       * clebsch_gordan(1/2, 1/2, T_location, mt_z, mt_s, Mt))
+            for sc, sd, ket_channel in kets:
+                # charge-conserving strong interaction: bra and ket must share the channel
+                if bra_channel != ket_channel:
+                    continue
+                channel = bra_channel
+                c = sc[0]; j_z = sc[1]; m_z = sc[2]; mt_z = sc[3]
+                d = sd[0]; j_s = sd[1]; m_s = sd[2]; mt_s = sd[3]
 
-            # Normalization Factors: Keep or remove this depending on convention
-            norm_xy = math.sqrt(1 + (1 if x == y else 0))
-            norm_zs = math.sqrt(1 + (1 if z == s else 0))
-            norm = norm_xy * norm_zs
+                sp_Trel = 0.0; sp_Vpn = 0.0; sp_Vpp = 0.0; sp_Vnn = 0.0
+                for rec in locations:
+                    J_location    = rec[1]
+                    T_location    = rec[2]
+                    Trel_location = rec[3]
+                    Vpn_location  = rec[4]
+                    Vpp_location  = rec[5]
+                    Vnn_location  = rec[6]
 
-            coeff = float(norm * cg_isospin * cg_momentum)
+                    cg_momentum = (clebsch_gordan(j_x, j_y, J_location, m_x, m_y, M)
+                                * clebsch_gordan(j_z, j_s, J_location, m_z, m_s, M))
 
-            # Trel is isospin-independent, so keep accumulating it
-            sp_Trel += coeff * Trel_location
+                    cg_isospin = (clebsch_gordan(1/2, 1/2, T_location, mt_x, mt_y, Mt)
+                               * clebsch_gordan(1/2, 1/2, T_location, mt_z, mt_s, Mt))
 
-            # Only accumulate the matching charge channel
-            if channel == "pn":
-                sp_Vpn += coeff * Vpn_location
-            elif channel == "pp":
-                sp_Vpp += coeff * Vpp_location
-            elif channel == "nn":
-                sp_Vnn += coeff * Vnn_location
+                    coeff = float(norm * cg_isospin * cg_momentum)
 
-        # Step 4: write the accumulated channel values once, after the location loop,
-        # instead of on every iteration (the running totals are unchanged).
-        sp_tbme[key][7]=sp_Trel;  sp_tbme[key][8]=sp_Vpn;  sp_tbme[key][9]=sp_Vpp;  sp_tbme[key][10]=sp_Vnn
+                    # Trel is isospin-independent, so keep accumulating it
+                    sp_Trel += coeff * Trel_location
+
+                    # Only accumulate the matching charge channel
+                    if channel == "pn":
+                        sp_Vpn += coeff * Vpn_location
+                    elif channel == "pp":
+                        sp_Vpp += coeff * Vpp_location
+                    elif channel == "nn":
+                        sp_Vnn += coeff * Vnn_location
+
+                # drop quartets that contribute nothing (same as the original output filter)
+                if sp_Trel == 0 and sp_Vpn == 0 and sp_Vpp == 0 and sp_Vnn == 0:
+                    continue
+                data1.append(((a, b, c, d), [x, y, z, s], sp_Trel, sp_Vpn, sp_Vpp, sp_Vnn))
 
 #===========================================================Writing Output Files=============================================================#
 
-headers1 = ["M-scheme quartet", "J-coupled quartet", "Trel", "Vpn", "Vpp", "Vnn"]
-data1 = []
-for key in sp_tbme.keys():
-    if sp_tbme[key][7] == 0 and sp_tbme[key][8] == 0 and sp_tbme[key][9] == 0 and sp_tbme[key][10] == 0:
-        continue
-    else:
-        data1.append([sp_tbme[key][0], sp_tbme[key][1], sp_tbme[key][7], sp_tbme[key][8], sp_tbme[key][9],sp_tbme[key][10]])
+# Sort by the m-scheme (a,b,c,d) sp_id quartet to reproduce the ORIGINAL output row order
+# (the original built its dictionary by ascending (a,b,c,d) and wrote nonzero rows in order).
+data1.sort(key=lambda row: row[0])
 
-with open("Mscheme.csv", "w", newline="") as fout1:
+headers1 = ["M-scheme quartet", "J-coupled quartet", "Trel", "Vpn", "Vpp", "Vnn"]
+
+with open(_args.out_mscheme, "w", newline="") as fout1:
     w = csv.writer(fout1)
     w.writerow(headers1)
-    w.writerows(data1)
+    w.writerows([list(sp_q), orb_q, tr, vpn, vpp, vnn] for sp_q, orb_q, tr, vpn, vpp, vnn in data1)
 
-with open("Tsingle.csv", "w", newline="") as fout2:
+with open(_args.out_tsingle, "w", newline="") as fout2:
     w = csv.writer(fout2)
     w.writerows(T_columns)
