@@ -9,7 +9,7 @@ A=2 ; Z = 1; Neut = A - Z; hw=16
 state_map_path = "/Users/habual01/NSCM/state_map_2B.csv"
 
 #MFDn is the two-body-matrix elements file in the coupled JT basis
-MFDN_path = "/Users/habual01/NSCM/NuHamil-public/exe/Helium_2_data_N3LO_EM500_srg1.0_hw16_emax4_e2max8.MFDn"
+MFDN_path = "Helium_2_data_N3LO_EM500_srg1.0_hw16_emax4_e2max8.MFDn"
 
 T_columns = []; sp_tbme = {}; mfdn_tbme = {}
 
