@@ -81,14 +81,33 @@ at **≈1 ms / quartet**.
 
 ## Practical implications
 
-- To estimate runtime for a new interaction, count its target (J=1, T=0) quartets and
-  multiply by ~1 ms (on the reference machine). A future emax6/8 MFDn with, say, 10–50×
-  more quartets would take roughly 10–50× as long.
-- The single-particle space can grow freely with negligible cost (only the kinetic
-  energy scales, and it is now O(states)).
-- The next optimization lever — relevant only once a **larger MFDn interaction** is
-  used — is parallelism: the MFDn orbital quartets are independent, so the decoupling
-  loop parallelizes near-linearly across cores (or via NumPy on the CG accumulation).
+- Runtime scales with the number of target (J=1, T=0) MFDn quartets, not the
+  single-particle space. The single-particle space can grow freely with negligible cost
+  (only the kinetic energy scales, and it is now O(states)).
+- For a large interaction, use the parallel path: the MFDn orbital quartets are
+  independent, so `--jobs N` decouples chunks across `N` worker processes. Each worker
+  streams its rows (sorted) to a temp file and the parent k-way-merges them, so memory
+  stays bounded and the output is **byte-for-byte identical to the serial run**.
+
+## Validation at scale: the emax8 interaction
+
+The emax8 e2max16 MFDn (`HELIUM_emax8_..._emax8_e2max16.MFDn`, 136 MB, 1.18M records,
+**41,365 target quartets** over orb_ids 1–45) is the first genuinely large case.
+
+| | value |
+|---|---|
+| target quartets | 41,365 |
+| output rows | 3,677,921 (274 MB `Mscheme.csv`) |
+| serial runtime (`--jobs 1`) | 64.5 s |
+| parallel runtime (`--jobs 9`, 10-core machine) | 28.9 s |
+| serial vs. parallel output | **byte-for-byte identical** |
+
+Note on the candidate count: of the ~62.5M (M, MT)-conserving substate quartets, only
+~3.7M (≈6%) survive — the rest have a vanishing Clebsch–Gordan coefficient and accumulate
+to exactly zero, so they are dropped. The parallel speedup (~2.2×, not ~9×) is Amdahl-limited
+by the serial phases: parsing the 136 MB MFDn, the final k-way merge, and writing the 274 MB
+output. (Both the input MFDn and the output exceed GitHub's 100 MB limit and are kept local /
+git-ignored; use Git LFS to version them.)
 
 ## Reproducing
 
@@ -97,6 +116,11 @@ at **≈1 ms / quartet**.
 python3 Mscheme.py --state-map emax4_state_map.csv \
                    --mfdn Helium_2_data_N3LO_EM500_srg1.0_hw16_emax4_e2max8.MFDn \
                    --out-mscheme Mscheme.csv --out-tsingle Tsingle.csv
+
+# large interaction (e.g. emax8): parallelize across cores (output identical to serial)
+python3 Mscheme.py --state-map emax8_state_map.csv \
+                   --mfdn HELIUM_emax8_N3LO_EM500_srg1.0_hw16_emax8_e2max16.MFDn \
+                   --jobs 9 --out-mscheme emax8_Mscheme.csv --out-tsingle emax8_Tsingle.csv
 ```
 
 Correctness is checked by diffing outputs against archived golden references

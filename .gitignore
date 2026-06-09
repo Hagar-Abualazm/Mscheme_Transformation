@@ -2,3 +2,7 @@
 __pycache__/
 *.pyc
 .DS_Store
+# large emax8 data/output (exceed GitHub 100MB limit; use Git LFS to version)
+HELIUM_emax8_*.MFDn
+emax8_Mscheme.csv
+emax8_Tsingle.csv
